@@ -1,16 +1,16 @@
 // Run & Gun - Koop-Spiel fuer zwei Spieler, laeuft im Browser.
-// Wird von der Seite des ShieldServers nachgeladen.
+// Wird von app.js nachgeladen und meldet sich als window.GAMES.C an.
 //
 // Lockstep: Der Server schickt allen dieselbe Folge aus Eingaben (input) und
 // Takten (tick). Jeder Browser rechnet damit exakt denselben Spielverlauf.
 // Deshalb: nur ganze Zahlen, eigener Zufallsgenerator, keine Uhrzeit in der Logik.
 //
-// Schnittstelle (window.RG):
-//   start(canvas, role, sendInput, sendEnd, msg)  role = "L", "R" oder "Z"
+// Schnittstelle (window.GAMES.C):
+//   start(ctx)             ctx: root, role ("L"/"R"/"Z"), settings, sendInput, end, toast, sound
 //   tick()                 ein Spielschritt (20 pro Sekunde)
 //   input(who, bits)       Eingabe von Spieler "L" oder "R"
 //   stop()                 aufraeumen
-//   hash()                 Pruefsumme des Spielstands (zum Testen)
+//   hash()                 Pruefsumme des Spielstands (Desync-Erkennung)
 (function () {
   "use strict";
 
@@ -28,7 +28,7 @@
   var TURRETS = [[500, 72], [880, 132], [1030, 66], [1350, 88], [1520, 70], [1600, 132], [1920, 88]];
   var BOSS_X = 2296;
 
-  var cv, g, myRole, sendInput, sendEnd, msg;
+  var cv, g, myRole, sendInput, sendEnd, msg, ctx;
   var st, lastTickAt, myBits, sentBits, keys, ui, raf, endSent;
 
   // ---------- Zufall (deterministisch) ----------
@@ -88,6 +88,7 @@
   function killPlayer(pl) {
     if (pl.dead || pl.out || pl.inv > 0) return;
     pl.lives--;
+    if (ctx) ctx.sound("bad");
     pl.dead = 30;                          // 1,5 s bis zum Wiedereinstieg
     if (pl.lives <= 0) pl.out = true;
   }
@@ -322,7 +323,7 @@
 
     // Anzeige oben
     g.font = "10px system-ui"; g.textAlign = "left";
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < (ctx && ctx.solo ? 1 : 2); i++) {
       g.fillStyle = COL[i];
       g.fillText((i ? "P2 " : "P1 ") + (s.p[i].out ? "aus" : "\u2665".repeat(s.p[i].lives)), 6 + i * 70, 12);
     }
@@ -359,44 +360,79 @@
   }
 
   function makeButtons() {
+    var size = Math.round(62 * (ctx.settings.ui || 100) / 100);
     var wrap = document.createElement("div");
-    wrap.style.cssText = "display:flex;justify-content:space-between;max-width:800px;margin:8px auto;padding:0 16px;touch-action:none;user-select:none;-webkit-user-select:none";
-    var left = document.createElement("div"), right = document.createElement("div");
+    wrap.style.cssText = "position:absolute;left:0;right:0;bottom:0;display:flex;justify-content:space-between;align-items:flex-end;" +
+      "padding:0 max(10px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));" +
+      "pointer-events:none;touch-action:none;user-select:none;-webkit-user-select:none;z-index:10";
+    var move = document.createElement("div"), act = document.createElement("div");
+    move.style.cssText = act.style.cssText = "display:grid;gap:6px;pointer-events:auto";
+    move.style.gridTemplateColumns = "repeat(3," + size + "px)";
+    act.style.gridTemplateColumns = "repeat(2," + size + "px)";
     var btns = [];
-    function mk(parent, label, bit) {
+    function mk(parent, label, bit, area) {
       var b = document.createElement("div");
       b.textContent = label;
-      b.style.cssText = "display:inline-block;width:56px;height:56px;line-height:56px;margin:3px;border-radius:12px;background:#2a3038;color:#fff;font:bold 18px system-ui;text-align:center;touch-action:none";
+      b.style.cssText = "width:" + size + "px;height:" + size + "px;line-height:" + size + "px;border-radius:16px;" +
+        "background:rgba(30,38,48,.55);border:1px solid rgba(255,255,255,.18);color:#fff;font:bold " + Math.round(size * 0.32) +
+        "px system-ui;text-align:center;touch-action:none;backdrop-filter:blur(2px)";
+      if (area) b.style.gridArea = area;
       var o = { el: b, bit: bit, down: false };
-      function set(v) { o.down = v; b.style.background = v ? "#2e7dff" : "#2a3038"; pushInput(); }
+      function set(v) {
+        if (o.down === v) return;
+        o.down = v; b.style.background = v ? "rgba(59,140,255,.8)" : "rgba(30,38,48,.55)"; pushInput();
+      }
       b.addEventListener("pointerdown", function (e) { e.preventDefault(); b.setPointerCapture(e.pointerId); set(true); });
       b.addEventListener("pointerup", function () { set(false); });
       b.addEventListener("pointercancel", function () { set(false); });
       b.addEventListener("lostpointercapture", function () { set(false); });
       parent.appendChild(b);
       btns.push(o);
+      return b;
     }
-    mk(left, "\u25C0", B_LEFT); mk(left, "\u25B2", B_UP); mk(left, "\u25BC", B_DOWN); mk(left, "\u25B6", B_RIGHT);
-    mk(right, "Spr.", B_JUMP); mk(right, "Feuer", B_FIRE);
-    wrap.appendChild(left); wrap.appendChild(right);
-    cv.parentNode.insertBefore(wrap, cv.nextSibling);
+    // Steuerkreuz: oben Mitte = zielen nach oben, Ecken = schraeg
+    var blank = function () { var d = document.createElement("div"); move.appendChild(d); };
+    blank(); mk(move, "\u25B2", B_UP); blank();
+    mk(move, "\u25C0", B_LEFT); mk(move, "\u25BC", B_DOWN); mk(move, "\u25B6", B_RIGHT);
+    mk(act, "\u2B06", B_JUMP).title = "Springen";
+    mk(act, "\u2739", B_FIRE).title = "Feuer";
+    var l = ctx.settings.left;
+    wrap.appendChild(l ? act : move); wrap.appendChild(l ? move : act);
+    ctx.root.appendChild(wrap);
     return { wrap: wrap, btns: btns };
   }
 
+  function fit() {
+    if (!cv) return;
+    var W = ctx.root.clientWidth, H = ctx.root.clientHeight;
+    var sc = Math.min(W / VW, H / VH);
+    cv.style.width = Math.floor(VW * sc) + "px";
+    cv.style.height = Math.floor(VH * sc) + "px";
+    cv.style.left = Math.floor((W - VW * sc) / 2) + "px";
+    cv.style.top = Math.floor((H - VH * sc) / 2) + "px";
+  }
+
   // ---------- Schnittstelle ----------
-  window.RG = {
-    start: function (canvas, role, sendIn, sendE, msgFn) {
-      cv = canvas; g = cv.getContext("2d");
+  window.GAMES = window.GAMES || {};
+  window.GAMES.C = {
+    start: function (c) {
+      ctx = c;
+      cv = document.createElement("canvas");
       cv.width = VW; cv.height = VH;
-      cv.style.imageRendering = "pixelated";
-      myRole = role; sendInput = sendIn; sendEnd = sendE; msg = msgFn;
+      cv.style.cssText = "position:absolute;image-rendering:pixelated;background:#000";
+      ctx.root.appendChild(cv);
+      g = cv.getContext("2d");
+      fit();
+      var role = ctx.role;
+      myRole = role; sendInput = ctx.sendInput; sendEnd = ctx.end; msg = ctx.toast;
       st = newState(); lastTickAt = performance.now();
+      if (ctx.solo) { st.p[1].out = true; st.p[1].lives = 0; }   // Einzelspieler: nur P1
       keys = 0; myBits = 0; sentBits = 0; endSent = false;
       if (role === "L" || role === "R") {
         ui = makeButtons();
         document.addEventListener("keydown", onKey);
         document.addEventListener("keyup", onKey);
-        msg("Run & Gun: du bist " + (role === "L" ? "P1 (blau)" : "P2 (rot)") + ". Pfeile/WASD, Leertaste springt, X schiesst");
+        msg("Du bist " + (role === "L" ? "P1 (blau)" : "P2 (rot)") + " \u2013 PC: Pfeile/WASD, Leertaste springt, X schiesst", 4000);
       } else {
         msg("Run & Gun: du schaust zu");
       }
@@ -407,6 +443,7 @@
       step();
       lastTickAt = performance.now();
       // 3 s nach Spielende der Server-Bescheid, dann startet er eine neue Runde
+      if (st.over === 1 && ctx) ctx.sound(st.won ? "win" : "bad");
       if (st.over === 60 && !endSent && (myRole === "L" || myRole === "R")) { endSent = true; sendEnd(); }
     },
     input: function (who, bits) {
@@ -422,7 +459,13 @@
       document.removeEventListener("keyup", onKey);
       if (ui && ui.wrap.parentNode) ui.wrap.parentNode.removeChild(ui.wrap);
       ui = null;
-      if (cv) cv.style.imageRendering = "";
+      cv = null; ctx = null;
+    },
+    resize: fit,
+    settingsChanged: function () {
+      if (!ui || !ctx) return;
+      ui.wrap.parentNode.removeChild(ui.wrap);
+      ui = makeButtons();
     },
     hash: function () {
       if (!st) return "";
